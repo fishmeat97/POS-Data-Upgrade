@@ -1,0 +1,7 @@
+pandas>=2.1
+numpy
+openpyxl
+xlrd>=2.0.1
+python-calamine
+streamlit>=1.50
+pytest
