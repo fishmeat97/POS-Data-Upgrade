@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-import Pos_core as core
+import pos_core as core
 
 # ============================================================
 # Page config  (MUST be the first Streamlit call - v1 called st.write before it)
