@@ -1,0 +1,159 @@
+# POS Monthly Data Transformation — 變更紀錄 CHANGE_RECORD
+
+版本：v1（你提供的 Streamlit 單檔）→ **v2.0.0**
+依據：`POS_Transformation_Code_Review.txt`（編號 A1–A9、B1–B12、C1–C9、D1–D7）
+
+---
+
+## 0. 交付檔案與使用方式
+
+| 檔案 | 說明 |
+|---|---|
+| `pos_core.py` | **去除 Streamlit 的版本**。所有轉換 / 偵測 / Mapping / 報表 / 核對 / 繳交追蹤 / 匯出邏輯，可直接 `import pos_core`，也可 CLI 執行 |
+| `app_streamlit.py` | **Streamlit 版本**。只含 UI，業務邏輯全部呼叫 `pos_core`（兩個檔案需放在同一資料夾） |
+| `test_pos_core.py`, `test_templates_extra.py` | 自動化測試（53 項） |
+| `requirements.txt` | 相依套件 |
+| `CHANGE_RECORD.md` | 本檔 |
+
+```bash
+pip install -r requirements.txt
+streamlit run app_streamlit.py                 # Streamlit 版
+python pos_core.py --pos ./pos_folder_or_zip --customer Customer.xlsx --sku SKU1.xlsx SKU2.xlsx --out report.xlsx   # 無 Streamlit 版 (CLI)
+python -m pytest -q                             # 測試
+```
+
+```python
+# 作為函式庫使用
+import pos_core as core
+res = core.run_transformation_pipeline(core.collect_pos_inputs("pos.zip"), "Customer.xlsx", ["SKU.xlsx"],
+        customer_mapping_sheet="Customer data", sku_mapping_sheet="SKU data",
+        config=core.PipelineConfig(duplicate_policy="flag"))
+res["final_report"]; res["upload_log"]; res["store_reconciliation"]
+```
+
+> 為什麼不是兩個「各自完整」的單檔？v1 的問題之一就是 Streamlit 與 core 兩份邏輯重複、容易不同步（D1）。
+> 現在邏輯只有一份（`pos_core.py`），`app_streamlit.py` 約 470 行純 UI。若你仍需要「單一檔案」部署，我可以把兩者合併，但會再次出現重複維護問題。
+
+---
+
+## 1. 變更對照表（Code Review → 修改）
+
+狀態：✅ 已完成並有測試 ／ 🟡 部分完成（說明於備註）／ ⏸ 未改（說明原因）
+
+### A. 高風險
+
+| ID | 狀態 | 修改內容 | 位置 | 測試 |
+|---|---|---|---|---|
+| A1 | ✅ | T14 只排除「代碼型」值（regex `^D\d{2,4}(-…)+$`，如 `D001-00-070-001`），`Dalmore / Dewar's` 等真實品名保留；排除筆數寫入警告 | `transform_template_14`, `_D_CODE_RE` | `test_t14_keeps_names_starting_with_D` |
+| A2 | ✅ | 新 `parse_number()`：條碼判斷涵蓋 `"4713268580974.0"` 與原生 float；嚴格解析（`700cc`、`2026-09`、`約12` → NaN）；`(5)` → -5。新增 `QTY_FLAG`（NEGATIVE / OUT_OF_RANGE，上限 `PipelineConfig.qty_abs_max`，預設 100000）套用到**所有** template | `parse_number`, `numeric`, `make_output` | `test_parse_number_*`, `test_qty_flag_*` |
+| A3 | ✅ | 偵測同 (年月, 店家編號) 的多檔重複提交：`upload_log["重複提交"]`、明細 `DUPLICATE_SUBMISSION`、頁面警告。政策 `duplicate_policy`：`flag`（預設，只標記）/ `keep_first` / `keep_last`。檔名 `(1)` 後綴也會警告 | `run_transformation_pipeline` | `test_duplicate_submission_flag_and_policy` |
+| A4 | ✅ | 新增 `QTY_UNIT`、`QTY_ORIGINAL`、`UNIT_STATUS`（OK / ASSUMED_BOTTLE / CONVERTED / NEEDS_REVIEW / UNKNOWN_UNIT）。**預設不自動換算**：箱/盒/組/包/桶 標記 NEEDS_REVIEW；`unit_factors={"箱":6}` 才會換算。T7（單位欄）、T8（單位格）也寫入 `QTY_UNIT` | `make_output`, `PipelineConfig` | `test_unit_flagged_not_converted_and_factor_applied` |
+| A5 | ✅ | T2 找不到當月「實銷」欄時仍 fallback，但會在 `upload_log["警告"]` 以 ⚠ 標示；日期解析不再把純數字當 epoch | `transform_template_2`, `_to_year_month` | `test_t2_matching_month_no_warning_and_fallback_warns` |
+| A6 | ✅ | 新增 `TemplateError`；T3 只在 `TemplateError` 時 3A→3B fallback，其他例外直接拋出 | `auto_transform_template` | `test_t3_falls_back_to_3b_on_template_error` |
+| A7 | ✅ | 多工作表 template（T3A/T4/T8/T15）略過名稱含 彙總/匯總/總表/summary/total/合計/總計 的 sheet，並在警告列出（關鍵字可改 `summary_sheet_keywords`） | `select_sheets` | `test_summary_sheet_skipped` |
+| A8 | ✅ | `CUSTOMER_MATCH_METHOD`（OUTLET / RAWDATA_FALLBACK / NONE）；Rawdata Name 對應到多個 Outlet 時**預設不做 fallback**（`ambiguous_rawdata_fallback="reject"`，舊行為為 `"first"`）；`customer_duplicates` 新增 `DUP_TYPE`（OUTLET_NO / RAWDATA_NAME）；Final Report 在 fallback 時 `店家編號` 改用 Mapping 的 Outlet No，使編號與店名一致 | `attach_customer_mapping`, `prepare_customer_mapping`, `build_report` | `test_customer_fallback_*`, `test_ambiguous_rawdata_*` |
+| A9 | ✅ | SKU 狀態改以 **join 結果**判斷：MAPPED / **INCOMPLETE**（有 join 但 Mapping Name 空白）/ UNMAPPED；新增 `RSP_STATUS`（OK / MISSING / UNMAPPED）；`sku_duplicates` 新增 `CONFLICT`（重複項目屬性不一致） | `attach_sku_mapping`, `prepare_sku_mapping` | `test_sku_incomplete_and_rsp_missing_and_conflict` |
+
+### B. 矛盾 / 不一致
+
+| ID | 狀態 | 修改內容 | 備註 |
+|---|---|---|---|
+| B1 | ✅ | 偵測與轉換共用同一組 alias 常數（`T1_SKU_ALIASES`、`T1_QTY_ALIASES`…），「銷售量」不再偵測成功卻轉換失敗 | `test_csv_t1_with_銷售量_header_*` |
+| B2 | ✅ | CSV 與 Excel 共用 `_detect_generic()`：一律 T7 → T1 | |
+| B3 | ✅ | 註解與程式一致：T10 / 全 template 現在真的排除表頭、合計、以下空白（`INVALID_SKU_KEYS`）；T7 單位白名單改為設定 `t7_unit_allow`；移除失效的 `RAW_PRODUCT_CODE` / `RAW_BARCODE` 輸出 | `test_nan_qty_and_total_rows_dropped_with_note`, T10 測試 |
+| B4 | ✅ | T16 以檔名店名找對應欄位（完全相等優先，再模糊比對；單字元表頭不再誤中）；找不到才退回「品名右側欄」並警告。偵測也收緊 | `test_t16_*` |
+| B5 | ✅ | 全 template 統一空數量政策：預設排除 QTY 空白/無法解析的列並記錄筆數（`drop_nan_qty=False` 可保留） | ⚠ 會使 Source Count 變少，見 §3 |
+| B6 | ✅ | 來源價格一律放 `RAW_UNIT_PRICE` / `RAW_TOTAL_PRICE`；移除無用的 `UNIT_PRICE` / `TOTAL_PRICE`（T3 原本會把價格丟掉） | 價格仍只用 RSP（政策不變） |
+| B7 | 🟡 | 決策：**一檔 = 一店**（以檔名為準，不變）。若檔內出現多個逐列客戶名稱，加警告。移除重複的 `RAW_CUSTOMER` | 若要支援「一檔多店」需新規格，未實作 |
+| B8 | ✅ | `SOURCE_ROW` 為原始 Excel / CSV 真實列號（先記錄列號再過濾）；`SOURCE_SHEET` 為實際工作表名；移除硬編碼與 `if False` 死碼；`SOURCE_QTY_COLUMN` 為實際使用欄位 | `test_t1_basic_and_real_source_rows_and_sheet_name` |
+| B9 | ✅ | 同 B8（T15 的 `SOURCE_QTY_COLUMN` 由實際比對欄位決定） | |
+| B10 | ✅ | 新增 `final_report_trace`（Final Report 21 欄 + SOURCE_FILE/SHEET/ROW、TEMPLATE_TYPE、FILE_OUTLET_NO、客戶狀態/配對方式、RSP_STATUS、單位/數量旗標、重複提交、來源價格）；`SALES_ID_CHECK` 補上（v1 引用但從未產生）。標準 `final_report` 欄位與順序不變 | Excel 多一張 `Final Report (Trace)` |
+| B11 | ✅ | `SourceFile` 讀取 Excel 會依副檔名嘗試 xlrd / openpyxl / calamine / 自動偵測；T6 不再因 xlsx 而失敗；`requirements.txt` 宣告相依 | |
+| B12 | ✅ | `as_source_file` 支援路徑、`(name, bytes)`、一般檔案物件、Streamlit UploadedFile；CSV 解碼不再有 latin1 亂碼 fallback（失敗會明確報錯）；CSV 以 csv 模組讀取，不再因欄數不齊而失敗 | `test_csv_cp950_*`, `test_source_from_file_like` |
+
+### C. 比對邏輯
+
+| ID | 狀態 | 修改內容 |
+|---|---|---|
+| C1 | ✅ | `first_matching_column`：改用 `norm_key`（`數 量` = `數量`），優先序依**關鍵字順序**（先完全相等、再包含），支援 `exclude`、`contains=False` |
+| C2 | ✅ | T8 與全域共用 `parse_number()`（移除重複的 `to_number`） |
+| C3 | ⏸ | 未改 `norm_key`（仍移除小數點 / %）。原因：改動會讓既有 SKU Mapping 的 key 全部失效，需先與業務確認 SKU Name 命名規則 |
+| C4 | ✅ | CSV 以字串讀取（ID 不丟前導 0）；Excel 文字格式的 ID 本來就保留 |
+| C5 | ✅ | ROC 年份範圍檢查（100–199）；`FILENAME_STATUS=CHECK` 時 log 加警告；新增 `FILE_COPY_SUFFIX` |
+| C6 | ✅ | T9 偵測移到 T3A 之前，T9 多 sheet 檔不再被誤判 |
+| C7 | ✅ | T4 續行：footer regex（頁碼、日期、合計…）、每個 sheet 重置續行目標、重複表頭列略過 |
+| C8 | 🟡 | T12 驗證「最後一欄」數值比例 ≥ 50%，否則報錯；T6/T10/T14 仍為固定欄位（無表頭可驗證），僅檢查最少欄數 |
+| C9 | ⏸ | T11 仍以「品牌」欄作為 SKU 名稱，**需你確認**這是否符合 SKU Mapping 的 SKU Name |
+
+### D. 架構
+
+| ID | 狀態 | 說明 |
+|---|---|---|
+| D1 | 🟡 | 已分成 `pos_core.py`（邏輯）與 `app_streamlit.py`（UI），邏輯單一來源；尚未再拆成多個模組 / Template 類別 |
+| D2 | 🟡 | 一部分規則已設定化（`PipelineConfig`：T7 單位過濾客戶與白名單、單位換算、彙總 sheet 關鍵字…）；檔名關鍵字（合歡、唯君…）仍在程式內 |
+| D3 | 🟡 | 新增 `table_frame()` + `make_output()` 取代 16 份重複樣板（過濾、單位、旗標、欄位組裝統一在一處）；各 template 只保留「如何找表頭 / 欄位」 |
+| D4 | ✅ | `SourceFile` 一次讀入並快取所有 sheet，偵測與轉換共用；表頭提升在記憶體內完成，不再重複 `read_excel` / `seek(0)` |
+| D5 | ✅ | pipeline 回傳結構化結果（含 `warnings`）；全部失敗時**仍回傳 upload_log**（`raise_on_all_failed=True` 可恢復舊行為）；`SourceFile.from_any` 移入 try，單一壞檔不會中斷整批 |
+| D6 | ✅ | 見 B10 |
+| D7 | ✅ | 53 項測試（見 §4） |
+
+---
+
+## 2. Streamlit 專屬修改（v1 檔案內另外發現的問題）
+
+| ID | 修改 |
+|---|---|
+| S1 | `st.write("Streamlit version")` 在 `st.set_page_config` 之前（會觸發錯誤）→ 移除，`set_page_config` 置於最前面 |
+| S2 | 重複的 `import streamlit` / `import io, re, pandas` 與兩次定義的 `STANDARD_HEADER_MAPPING`、`find_header_row`、`normalize_period_key` 等 → 全部整併為 core 內單一定義 |
+| S3 | **處理流程改為按「Start」只跑一次**，結果存在 `st.session_state`。v1 每次操作（換月份、篩選、下載）都會整段重跑處理 |
+| S4 | 匯出檔依月份**只產生一次**並快取（v1 每次 rerun 都重新產生 Excel） |
+| S5 | **預覽頁籤修正**：v1 以 `pd.concat([detail.loc[mask], final_report.loc[mask]], axis=1)` 並排，但 `final_report` 已重新排序，兩邊列對不上（資料錯位）。v2 預覽直接顯示 `detail` 稽核欄位，不再並排 |
+| S6 | 移除 `DEBUG：Store Reconciliation 已執行` 區塊與頁尾重複的核對表（改為可收合的 expander） |
+| S7 | `logo.png` 不存在時不再讓整個頁面崩潰 |
+| S8 | `st.dataframe(height=None)` 在新版 Streamlit 會報錯 → 改為 `"auto"`（煙霧測試時發現並修正） |
+| S9 | ZIP 解壓放入 `st.cache_data`；ZIP 內非 UTF-8（cp437 誤判）的中文檔名嘗試以 cp950 還原 |
+| S10 | 新增「處理選項」（重複提交政策、箱換算、數量上限、是否排除空數量）與「Data Quality Flags」區塊、「數量/單位待確認」頁籤、進度條 |
+
+---
+
+## 3. ⚠ 行為變更（升級時請留意）
+
+1. **Source Count 可能變少**：所有 template 現在排除數量空白 / 無法解析的列（B5）、表頭 / 合計列（B3）。原因會寫在 `upload_log["警告"]`。
+2. **數量解析較嚴格**：`700cc`、`約12`、`2026-09` 不再被當成數字（A2/C2）。若原本靠這種寬鬆解析才有資料，會出現在警告「已排除 N 筆數量空白或無法解析的列」。
+3. **T14 會多出以 D 開頭的真實品名**（A1）。
+4. **更多 UNMAPPED**：Rawdata Name 對應到多個 Outlet 時不再自動取第一筆（A8）。要恢復舊行為：`PipelineConfig(ambiguous_rawdata_fallback="first")`。
+5. **`SKU Mapping Status` 多一個值 `INCOMPLETE`**（A9）。下游若只判斷 UNMAPPED，請一併處理。
+6. **Fallback 配對時 `店家編號` 變成 Mapping 的 Outlet No**（A8）。
+7. **欄位異動**（detail / audit）：移除 `RAW_CUSTOMER`、`RAW_PRODUCT_CODE`、`RAW_BARCODE`、`UNIT_PRICE`、`TOTAL_PRICE`、`SOURCE_INNER_ROW`；新增 `QTY_UNIT`、`QTY_ORIGINAL`、`UNIT_STATUS`、`QTY_FLAG`、`RSP_STATUS`、`CUSTOMER_MATCH_METHOD`、`DUPLICATE_SUBMISSION`、`SALES_ID_CHECK`、`FILE_INDEX`、`FILE_COPY_SUFFIX`。**Final Report 的 21 欄不變。**
+8. **API**：`load_sku_mapping()` 回傳 3 個值（含 log）；pipeline 全部失敗不再 raise；pipeline 回傳多了 `final_report_trace`、`sku_upload_log`、`store_reconciliation`、`customer_map`、`sku_map`、`warnings`。
+9. **偵測順序**：T9 先於 T3A；CSV 與 Excel 皆為 T7 → T1；T7 的 label 改為「Generic SKU / QTY」。
+10. **CSV 解碼**：不再 fallback 到 latin1。
+
+---
+
+## 4. 驗證紀錄
+
+| 項目 | 結果 |
+|---|---|
+| `pytest`（53 項：數字解析、檔名、欄位比對、T1–T16 偵測與轉換、A1–A9 各項、重複提交、fallback、SKU 狀態、繳交追蹤、Excel 匯出、ZIP） | 53 passed，無 warning（pandas 3.0.6 / Python 3.12） |
+| Streamlit `AppTest` 煙霧測試（預先載入 pipeline 結果，執行整支 app、切換月份 selectbox 重跑） | 無例外；指標、3 個下載按鈕正常；此測試抓到 S8 |
+| CLI（資料夾輸入 → Excel 輸出） | 成功，8 張工作表 |
+
+**尚未驗證（請在你的環境確認）**
+- 以**你的真實檔案**跑一遍（我只有合成資料）。建議先用 `duplicate_policy=flag`、不改其他預設，對照 v1 的 Final Report 總量，差異應能由 `upload_log["警告"]` 解釋。
+- 真實 `.xls`（T6/T10/T14）以 xlrd 讀取：測試是以「注入已解析 sheet」方式驗證，沒有實體 .xls 檔。
+- pandas 2.x 相容性（開發環境為 pandas 3.0.6；程式未使用 3.x 專屬 API，但未實測 2.x）。
+- Streamlit 以 `AppTest` 測試，非實際瀏覽器上傳流程（file_uploader 無法在 AppTest 中模擬）。
+
+---
+
+## 5. 待辦 / 需要你決策
+
+| 項目 | 說明 |
+|---|---|
+| C3 | 是否要改 `norm_key`（保留小數點 / %）？需同步整理 SKU Mapping 的 SKU Name |
+| C9 | T11 以「品牌」當 SKU 是否正確？ |
+| A4 | 「箱 / 盒 / 組」各等於幾瓶？確定後填入 `unit_factors` |
+| A3 | 重複提交要「只標記」還是「自動保留第一/最後一份」？ |
+| B7 | 是否有「一檔多店」的來源？ |
+| D1/D2 | 是否要進一步把 Template 拆成獨立模組並以 YAML 設定客戶專屬規則？ |
